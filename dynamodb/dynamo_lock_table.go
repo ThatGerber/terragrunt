@@ -2,6 +2,7 @@ package dynamodb
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -52,9 +53,167 @@ func CreateLockTableIfNecessary(tableName string, tags map[string]string, client
 	return nil
 }
 
+// CreateLockTableFromOpts creates a lock table in DynamoDB and will wait until
+// it is in "active" state. If the table already exists, merely wait until it
+// is in "active" state.
+func CreateLockTableFromOpts(opts *TableConfig, client *dynamodb.DynamoDB, terragruntOptions *options.TerragruntOptions) error {
+	if tableExists, err := LockTableExistsAndIsActive(opts.TableName, client); tableExists && err == nil {
+		return nil
+	}
+
+	tableCreateDeleteSemaphore.Acquire()
+	defer tableCreateDeleteSemaphore.Release()
+
+	terragruntOptions.Logger.Printf("Creating table %s in DynamoDB", opts.TableName)
+	tableTags := []*dynamodb.Tag{}
+
+	for k, v := range opts.Tags {
+		tableTags = append(tableTags, &dynamodb.Tag{Key: aws.String(k), Value: aws.String(v)})
+	}
+
+	// Build Create Request
+	args := &dynamodb.CreateTableInput{
+		TableName: aws.String(opts.TableName),
+		AttributeDefinitions: []*dynamodb.AttributeDefinition{
+			&dynamodb.AttributeDefinition{
+				AttributeName: aws.String(ATTR_LOCK_ID),
+				AttributeType: aws.String(dynamodb.ScalarAttributeTypeS),
+			},
+		},
+		KeySchema: []*dynamodb.KeySchemaElement{
+			&dynamodb.KeySchemaElement{
+				AttributeName: aws.String(ATTR_LOCK_ID),
+				KeyType:       aws.String(dynamodb.KeyTypeHash),
+			},
+		},
+		BillingMode: aws.String(opts.BillingMode.String()),
+		Tags:        tableTags,
+	}
+
+	if *opts.BillingMode == provisionedBilling {
+		args.ProvisionedThroughput = opts.ProvisionedThroughput
+	}
+
+	if opts.Encryption.Enabled {
+		args.SSESpecification = &dynamodb.SSESpecification{
+			Enabled: aws.Bool(true),
+			SSEType: aws.String("KMS"),
+		}
+		if opts.Encryption.KMSKeyID != nil {
+			args.SSESpecification.SetKMSMasterKeyId(*opts.Encryption.KMSKeyID)
+		}
+	}
+
+	// Create
+	var err error
+
+	if _, err = client.CreateTable(args); err != nil {
+		if isTableAlreadyBeingCreatedOrUpdatedError(err) {
+			terragruntOptions.Logger.Printf("Looks like someone created table %s at the same time. Will wait for it to be in active state.", opts.TableName)
+		} else {
+			return errors.WithStackTrace(err)
+		}
+	}
+
+	if err = waitForTableToBeActive(opts.TableName, client, MAX_RETRIES_WAITING_FOR_TABLE_TO_BE_ACTIVE, SLEEP_BETWEEN_TABLE_STATUS_CHECKS, terragruntOptions); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// UpdateLockTableFromOpts updates a lock table in DynamoDB and will wait until
+// it is in "active" state. If the table already exists, merely wait until it
+// is in "active" state.
+func UpdateLockTableFromOpts(opts *TableConfig, client *dynamodb.DynamoDB, terragruntOptions *options.TerragruntOptions) error {
+	terragruntOptions.Logger.Printf("Updating table %s in DynamoDB", opts.TableName)
+
+	table, err := client.DescribeTable(&dynamodb.DescribeTableInput{TableName: aws.String(opts.TableName)})
+	if err != nil {
+		return errors.WithStackTrace(err)
+	}
+
+	args := &dynamodb.UpdateTableInput{
+		TableName: aws.String(opts.TableName),
+	}
+
+	// Update billing mode
+	if !opts.BillingMode.Equal(table.Table.BillingModeSummary.BillingMode) {
+		billingModeArgs := args
+		billingModeArgs.BillingMode = aws.String(opts.BillingMode.String())
+
+		if *opts.BillingMode == provisionedBilling {
+			billingModeArgs.ProvisionedThroughput = opts.ProvisionedThroughput
+		}
+
+		if _, err = client.UpdateTable(billingModeArgs); err != nil {
+			if isTableAlreadyBeingCreatedOrUpdatedError(err) {
+				terragruntOptions.Logger.Printf("Looks like someone created table %s at the same time. Will wait for it to be in active state.", opts.TableName)
+			} else {
+				return errors.WithStackTrace(err)
+			}
+		}
+
+		if err = waitForTableToBeActive(opts.TableName, client, MAX_RETRIES_WAITING_FOR_TABLE_TO_BE_ACTIVE, SLEEP_BETWEEN_TABLE_STATUS_CHECKS, terragruntOptions); err != nil {
+			return errors.WithStackTrace(err)
+		}
+	}
+
+	sseArgs := args
+	updateEncryption := false
+	// Update Encryption
+	switch {
+	case table.Table.SSEDescription != nil && opts.Encryption.KMSKeyID == nil:
+		fallthrough
+	case opts.Encryption.Enabled != (table.Table.SSEDescription != nil):
+		updateEncryption = true
+
+	case table.Table.SSEDescription.KMSMasterKeyArn != opts.Encryption.KMSKeyID:
+		updateEncryption = true
+		sseArgs.SSESpecification = &dynamodb.SSESpecification{
+			Enabled:        aws.Bool(true),
+			SSEType:        aws.String("KMS"),
+			KMSMasterKeyId: opts.Encryption.KMSKeyID,
+		}
+
+	case table.Table.SSEDescription == nil && opts.Encryption.KMSKeyID != nil:
+		updateEncryption = true
+		sseArgs.SSESpecification = &dynamodb.SSESpecification{
+			Enabled:        aws.Bool(true),
+			SSEType:        aws.String("KMS"),
+			KMSMasterKeyId: opts.Encryption.KMSKeyID,
+		}
+	}
+
+	if updateEncryption {
+		if _, err = client.UpdateTable(sseArgs); err != nil {
+			if isTableAlreadyBeingCreatedOrUpdatedError(err) {
+				terragruntOptions.Logger.Printf("Looks like someone created table %s at the same time. Will wait for it to be in active state.", opts.TableName)
+			} else {
+				return errors.WithStackTrace(err)
+			}
+		}
+
+		if err = waitForTableToBeActive(opts.TableName, client, MAX_RETRIES_WAITING_FOR_TABLE_TO_BE_ACTIVE, SLEEP_BETWEEN_TABLE_STATUS_CHECKS, terragruntOptions); err != nil {
+			return errors.WithStackTrace(err)
+		}
+	}
+
+	// Update Tags
+	if len(opts.Tags) != 0 {
+		err = tagTableIfTagsGiven(opts.Tags, table.Table.TableArn, client, terragruntOptions)
+		if err != nil {
+			return errors.WithStackTrace(err)
+		}
+	}
+
+	return nil
+}
+
 // Return true if the lock table exists in DynamoDB and is in "active" state
 func LockTableExistsAndIsActive(tableName string, client *dynamodb.DynamoDB) (bool, error) {
 	output, err := client.DescribeTable(&dynamodb.DescribeTableInput{TableName: aws.String(tableName)})
+
 	if err != nil {
 		if awsErr, isAwsErr := err.(awserr.Error); isAwsErr && awsErr.Code() == "ResourceNotFoundException" {
 			return false, nil
@@ -292,3 +451,78 @@ type TableEncryptedRetriesExceeded struct {
 func (err TableEncryptedRetriesExceeded) Error() string {
 	return fmt.Sprintf("Table %s still does not have encryption enabled after %d retries.", err.TableName, err.Retries)
 }
+
+// NewTableConfig creates a new Table Config with defaults.
+func NewTableConfig() *TableConfig {
+	billingMode := defaultBillingMode
+
+	return &TableConfig{
+		TableName: "",
+		Encryption: &TableEncryption{
+			Enabled:  false,
+			KMSKeyID: nil,
+		},
+		BillingMode: &billingMode,
+		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
+			ReadCapacityUnits:  aws.Int64(DEFAULT_READ_CAPACITY_UNITS),
+			WriteCapacityUnits: aws.Int64(DEFAULT_WRITE_CAPACITY_UNITS),
+		},
+		Tags: map[string]string{},
+	}
+}
+
+// TableConfig contains additional configuration to lay on top of the dynamoDB
+// table.
+type TableConfig struct {
+	TableName             string                          `mapstructure:"table_name"`
+	Encryption            *TableEncryption                `mapstructure:"encryption"`
+	BillingMode           *dynamoDBBillingMode            `mapstructure:"billing_mode"`
+	ProvisionedThroughput *dynamodb.ProvisionedThroughput `mapstructure:"provisioned_throughput"`
+	Tags                  map[string]string               `mapstructure:"tags"`
+}
+
+func (t *TableConfig) Equal(p *TableConfig) bool {
+	if t.TableName != p.TableName {
+		return false
+	}
+	if t.Encryption != p.Encryption {
+		return false
+	}
+	if t.BillingMode != p.BillingMode {
+		return false
+	}
+	if t.ProvisionedThroughput != p.ProvisionedThroughput {
+		return false
+	}
+	if len(t.Tags) != len(p.Tags) {
+		return false
+	}
+
+	return true
+}
+
+// TableEncryption represents the intended configuration for SSE for a DynamoDB
+// table. Encryption is enabled by default; this assigns a customer managed key
+// to the table or tells it to use the default customer-managed CMK.
+type TableEncryption struct {
+	Enabled  bool    `mapstructure:"enabled"`
+	KMSKeyID *string `mapstructure:"kms_key_id"`
+}
+
+type dynamoDBBillingMode string
+
+// String value of the object.
+func (d *dynamoDBBillingMode) String() string {
+	return strings.ToUpper(string(*d))
+}
+
+// Equal compares the struct against a pointer string.
+func (d *dynamoDBBillingMode) Equal(p *string) bool {
+	return d.String() == strings.ToUpper(*p)
+}
+
+const (
+	provisionedBilling   dynamoDBBillingMode = "PROVISIONED"
+	payPerRequestBilling dynamoDBBillingMode = "PAY_PER_REQUEST"
+	defaultBillingMode                       = provisionedBilling
+)

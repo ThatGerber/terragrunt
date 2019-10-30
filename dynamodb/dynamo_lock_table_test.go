@@ -130,3 +130,26 @@ func assertTags(expectedTags map[string]string, tableName string, client *dynamo
 
 	assert.Equal(t, expectedTags, actualTags, "Did not find expected tags on dynamo table.")
 }
+
+func TestCreateLockTableFromOpts(t *testing.T) {
+	t.Parallel()
+
+	mode := payPerRequestBilling
+	opts := &TableConfig{
+		TableName:   uniqueTableNameForTest(),
+		Encryption:  &TableEncryption{Enabled: true},
+		BillingMode: &mode,
+		Tags:        map[string]string{"TAGGED": "true"},
+	}
+
+	client := createDynamoDbClientForTest(t)
+	mockOptions, err := options.NewTerragruntOptionsForTest("dynamo_lock_test_utils")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CreateLockTableFromOpts(opts, client, mockOptions)
+	assert.Nil(t, err, "Unexpected error: %v", err)
+	defer cleanupTableForTest(t, opts.TableName, client)
+
+	assertCanWriteToTable(t, opts.TableName, client)
+}

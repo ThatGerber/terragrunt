@@ -18,20 +18,73 @@ import (
 	"github.com/mitchellh/mapstructure"
 )
 
-/*
- * We use this construct to separate the two config keys 's3_bucket_tags' and 'dynamodb_table_tags'
- * from the others, as they are specific to the s3 backend, but only used by terragrunt to tag
- * the s3 bucket and the dynamo db, in case it has to create them.
- */
+// LockTableDescriptor describes the name and tags for a DynamoDB lock table.
+type LockTableDescriptor interface {
+	GetLockTableName() string
+	GetDynamoDBTags() map[string]string
+}
+
+// AwsRemoteStateConfig is an interface for accessing config for S3 Remote state.
+type AwsRemoteStateConfig interface {
+	GetAwsSessionConfig() *aws_helper.AwsSessionConfig
+	GetDynamoDBTableConfig() *dynamodb.TableConfig
+	LockTableDescriptor
+}
+
+// ExtendedRemoteStateConfigS3 is used to separate the two config keys
+// 's3_bucket_tags' and 'dynamodb_table_tags' from the others, as they are
+// specific to the s3 backend, but only used by terragrunt to tag the s3 bucket
+// and the dynamodb, in case it has to create them.
 type ExtendedRemoteStateConfigS3 struct {
 	remoteStateConfigS3 RemoteStateConfigS3
 
-	S3BucketTags                map[string]string `mapstructure:"s3_bucket_tags"`
-	DynamotableTags             map[string]string `mapstructure:"dynamodb_table_tags"`
-	SkipBucketVersioning        bool              `mapstructure:"skip_bucket_versioning"`
-	SkipBucketSSEncryption      bool              `mapstructure:"skip_bucket_ssencryption"`
-	SkipBucketAccessLogging     bool              `mapstructure:"skip_bucket_accesslogging"`
-	EnableLockTableSSEncryption bool              `mapstructure:"enable_lock_table_ssencryption"`
+	S3BucketTags                map[string]string     `mapstructure:"s3_bucket_tags"`
+	DynamotableTags             map[string]string     `mapstructure:"dynamodb_table_tags"`
+	SkipBucketVersioning        bool                  `mapstructure:"skip_bucket_versioning"`
+	SkipBucketSSEncryption      bool                  `mapstructure:"skip_bucket_ssencryption"`
+	SkipBucketAccessLogging     bool                  `mapstructure:"skip_bucket_accesslogging"`
+	EnableLockTableSSEncryption bool                  `mapstructure:"enable_lock_table_ssencryption"`
+	DynamoDBTableConfig         *dynamodb.TableConfig `mapstructure:"dynamodb_table_config"`
+}
+
+// GetLockTableName filters through config and returns the name of the lock table.
+func (c *ExtendedRemoteStateConfigS3) GetLockTableName() string {
+	if c.remoteStateConfigS3.DynamoDBTable != "" {
+		return c.remoteStateConfigS3.DynamoDBTable
+	}
+
+	if c.DynamoDBTableConfig.TableName != "" {
+		return c.DynamoDBTableConfig.TableName
+	}
+
+	return c.remoteStateConfigS3.LockTable
+}
+
+// GetAwsSessionConfig builds a session config for AWS related requests from
+// the ExtendedRemoteStateConfigS3 configuration. It wraps a call to the
+// inherited config to fulfill the interface.
+func (c *ExtendedRemoteStateConfigS3) GetAwsSessionConfig() *aws_helper.AwsSessionConfig {
+	return c.remoteStateConfigS3.GetAwsSessionConfig()
+}
+
+// GetDynamoDBTableConfig returns a ``dynamoDB.TableConfig`` object.
+func (c *ExtendedRemoteStateConfigS3) GetDynamoDBTableConfig() *dynamodb.TableConfig {
+	nilConfig := &dynamodb.TableConfig{}
+
+	if c.DynamoDBTableConfig.Equal(nilConfig) {
+		c.DynamoDBTableConfig = dynamodb.NewTableConfig()
+	}
+
+	if c.EnableLockTableSSEncryption != c.DynamoDBTableConfig.Encryption.Enabled {
+		c.DynamoDBTableConfig.Encryption.Enabled = c.EnableLockTableSSEncryption
+	}
+
+	return c.DynamoDBTableConfig
+}
+
+// GetDynamoDBTags returns a map of key:value pairs representing tags.
+func (c *ExtendedRemoteStateConfigS3) GetDynamoDBTags() map[string]string {
+	return c.DynamotableTags
 }
 
 // These are settings that can appear in the remote_state config that are ONLY used by Terragrunt and NOT forwarded
@@ -43,6 +96,7 @@ var terragruntOnlyConfigs = []string{
 	"skip_bucket_ssencryption",
 	"skip_bucket_accesslogging",
 	"enable_lock_table_ssencryption",
+	"dynamodb_table_config",
 }
 
 // A representation of the configuration options available for S3 remote state
@@ -60,7 +114,6 @@ type RemoteStateConfigS3 struct {
 	S3ForcePathStyle bool   `mapstructure:"force_path_style"`
 }
 
-// Builds a session config for AWS related requests from the RemoteStateConfigS3 configuration
 func (c *RemoteStateConfigS3) GetAwsSessionConfig() *aws_helper.AwsSessionConfig {
 	return &aws_helper.AwsSessionConfig{
 		Region:           c.Region,
@@ -217,7 +270,11 @@ func (s3Initializer S3Initializer) Initialize(remoteState *RemoteState, terragru
 		}
 	}
 
-	if err := createLockTableIfNecessary(&s3Config, s3ConfigExtended.DynamotableTags, terragruntOptions); err != nil {
+	if err := createLockTableIfNecessary(s3ConfigExtended, terragruntOptions); err != nil {
+		return err
+	}
+
+	if err := updateLockTableIfNecessary(s3ConfigExtended, terragruntOptions); err != nil {
 		return err
 	}
 
@@ -256,6 +313,7 @@ func parseS3Config(config map[string]interface{}) (*RemoteStateConfigS3, error) 
 func parseExtendedS3Config(config map[string]interface{}) (*ExtendedRemoteStateConfigS3, error) {
 	var s3Config RemoteStateConfigS3
 	var extendedConfig ExtendedRemoteStateConfigS3
+	// dynamoConfig := &dynamodb.TableConfig{}
 
 	if err := mapstructure.Decode(config, &s3Config); err != nil {
 		return nil, errors.WithStackTrace(err)
@@ -264,8 +322,12 @@ func parseExtendedS3Config(config map[string]interface{}) (*ExtendedRemoteStateC
 	if err := mapstructure.Decode(config, &extendedConfig); err != nil {
 		return nil, errors.WithStackTrace(err)
 	}
-
 	extendedConfig.remoteStateConfigS3 = s3Config
+
+	// if err := mapstructure.Decode(config["dynamodb_table_config"], dynamoConfig); err != nil {
+	// 	return nil, err //errors.WithStackTrace(err)
+	// }
+	// extendedConfig.DynamoDBTableConfig = dynamoConfig
 
 	return &extendedConfig, nil
 }
@@ -594,8 +656,22 @@ func DoesS3BucketExist(s3Client *s3.S3, config *RemoteStateConfigS3) bool {
 }
 
 // Create a table for locks in DynamoDB if the user has configured a lock table and the table doesn't already exist
-func createLockTableIfNecessary(s3Config *RemoteStateConfigS3, tags map[string]string, terragruntOptions *options.TerragruntOptions) error {
+func createLockTableIfNecessary(s3Config AwsRemoteStateConfig, terragruntOptions *options.TerragruntOptions) error {
+	if s3Config.GetLockTableName() == "" {
+		return nil
+	}
 
+	dynamodbClient, err := dynamodb.CreateDynamoDbClient(s3Config.GetAwsSessionConfig(), terragruntOptions)
+	if err != nil {
+		return err
+	}
+	config := getTableConfig(s3Config)
+	terragruntOptions.Logger.Println(config)
+	return dynamodb.CreateLockTableFromOpts(config, dynamodbClient, terragruntOptions)
+}
+
+// Update a table for locks in DynamoDB if the user has configured a lock table and the table doesn't already exist
+func updateLockTableIfNecessary(s3Config AwsRemoteStateConfig, terragruntOptions *options.TerragruntOptions) error {
 	if s3Config.GetLockTableName() == "" {
 		return nil
 	}
@@ -605,7 +681,17 @@ func createLockTableIfNecessary(s3Config *RemoteStateConfigS3, tags map[string]s
 		return err
 	}
 
-	return dynamodb.CreateLockTableIfNecessary(s3Config.GetLockTableName(), tags, dynamodbClient, terragruntOptions)
+	return dynamodb.UpdateLockTableFromOpts(getTableConfig(s3Config), dynamodbClient, terragruntOptions)
+}
+
+func getTableConfig(s3Config AwsRemoteStateConfig) *dynamodb.TableConfig {
+	tableConfig := s3Config.GetDynamoDBTableConfig()
+	tableConfig.TableName = s3Config.GetLockTableName()
+	if len(tableConfig.Tags) == 0 {
+		tableConfig.Tags = s3Config.GetDynamoDBTags()
+	}
+
+	return tableConfig
 }
 
 // Update a table for locks in DynamoDB if the user has configured a lock table and the table's server-side encryption isn't turned on
